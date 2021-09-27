@@ -1,0 +1,316 @@
+---
+title: "Lending Club Competition Report"
+author: "Susanne Schaftenaar"
+date: "Last edited `r Sys.Date()`"
+output: html_document
+df_print: paged
+
+---
+
+## Introduction
+This report details the steps followed in the ML competition organised within the Advanced ML course taken at GSERM St:Gallen June 2021. The competition's main aim was to predict Lending Club loan defaults. To that end, we received two datasets: a train dataset that included 500 000 labelled examples, and a test dataset that consisted of 150 000 unlabelled examples. The main evaluation criterium is each model's AUC-score on the test data.
+
+This notebook details the full process followed during the competition. I start with introducing the data exploration and subsequent data preparation and feature engineering. During the course, I have tested many different models and model set-ups (predictive logits, random forests, C50 decision trees, and gbm). I present the best performing logit, the best performing random forest, and the best performing gbm. The overall best model (a gbm) measured an AUC of 0.732 on the validation data, and is submitted with this report to the final competition.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, include=FALSE}
+library(tidyverse)
+library(visdat)
+library(skimr)
+library(pROC)
+library(caret)
+library(gbm)
+library(C50)
+```
+
+
+```{r data import, include=FALSE}
+# import the full train set
+lc_full_train <- read.csv("lending_club_train.csv", stringsAsFactors = FALSE)
+
+# import the unlabelled test set (don't touch!)
+lc_test <- read.csv("lending_club_test.csv", stringsAsFactors = FALSE)
+
+
+# create a Combined Dataset for feature engineering (i.e. select same vars/ impute data)
+
+# use union() to create a "long" combination of training and test data
+lc_features <- union(
+  # the mutate function adds a source so we can split it again later
+  lc_full_train %>% mutate(data_source = "train"),
+  lc_test %>% mutate(data_source = "test")
+)
+
+# confirm that the union worked correctly
+table(lc_features$data_source)
+
+```
+
+## Data exploration, preparation and feature engineering
+I start the competition by importing both the training and test data sets. I further create a complete data set consisting of the union of the training and test data. This complete data set is created for future data preparation and feature engineering (see next section). For data exploration, I only look at the training data to avoid potential fitting on the test data. I start by getting a quick overview. I first read the codebook. I do not have domain knowledge, so I looked up unfamiliar terms to get some stronger footing to tackle the problem at hand.
+
+I continued by looking at the structure of the data. The training sample has 103 features and 500 000 examples. Overall, the data consists of a target feature "default," 101 predictors, and one key "id". I proceed by visualising data types and missing data.
+
+
+```{r data structure, echo=TRUE, include=FALSE}
+str(lc_full_train)
+```
+
+
+```{r data visualisation original data}
+vis_dat(lc_full_train[1:7500,], sort_type = FALSE) 
+vis_miss(lc_full_train[1:7500,]) 
+
+```
+```{r further data visualisation on other subsamples, include=FALSE}
+vis_dat(lc_full_train[250000:257500,], sort_type = FALSE) 
+vis_dat(lc_full_train[480000:487500,], sort_type = FALSE) 
+
+```
+
+The first plot shows that the dataset includes numeric (integer/numeric) and character data. The character data needs to be further explored to assess how these should be transformed into features that can be included for analysis (for instance: converting them into numeric or factor variables). It is also useful to further explore the distributions of numeric variables to see if they would benefit from any feature engineering.
+
+A more imminent problem, however, are the large portions of missing values. List-wise deletion would result in a large reduction of examples and a large loss of information to predict defaults. Instead I opt for imputation. There are some features that are completely missing though. The features with information about secondary applications are 100% missing. I therefore drop all these features (ending with _sec). In addition, I drop "revol_bal_joint" due to only missing values.
+
+I then proceed with imputation of the remaining numeric features. First, I create a dummy for each numeric feature indicating whether an observation had a missing value or not. Then I imputed all missing values with -1. The dummies allow for assessing whether the missing data actually are predictive in some way of defaults. The character feature "Verification status" suffers from lots of missing values. I convert this feature to a factor with three levels. Some cells indicated "Not verified", which is retained, empty cells are "Other", and NAs are "Missing". This results in a fully imputed data frame (the above processing has been applied to the full dataframe including the train and test data).
+
+
+```{r imputation and feature downsizing, include=FALSE}
+
+lc_features <- lc_features %>% 
+  select(-starts_with("sec_"), # removes all vars that start with "sec" (no values)
+         -revol_bal_joint)  # no values
+
+# look at data types and missingness
+lc_features %>% 
+  filter(data_source == "train"[1:5000]) %>% 
+  vis_miss()
+
+lc_features %>% 
+  filter(data_source == "train"[1:5000]) %>% 
+  vis_dat(sort_type = FALSE)  
+
+# impute numeric data
+lc_features_imp <- lc_features %>%
+  mutate_if(anyNA, list(mvi = ~if_else(is.na(.), 1, 0))) %>%  # create dummies for missing
+  select(-emp_title_mvi, # these are categorical/ characterand will be handled separately
+         -title_mvi,
+         -verification_status_joint_mvi,
+         -default_mvi, # target should not have one (obviously omitted in test)
+         -dti_mvi) %>% # only one example with missing data
+  mutate(default = factor(default, # also create factor from default(required for some models)
+            levels = c(0, 1), 
+            labels = c("no","yes"))) %>% # factorise default (handy for some models + does not impute on next line)
+  mutate_if(is.numeric , replace_na, replace = -1) %>% # replace numeric NAs with -1
+  mutate(verification_status_joint = recode(verification_status_joint, 
+                                            "Not Verified" =  "Not Verified",
+                                            .default = "Other")) %>% 
+  replace_na(list(verification_status_joint = "Missing")) # keep spaces and NA as separate categories(large, but not sure what the difference is)
+
+```
+
+
+```{r plot after imputation, echo=FALSE}
+lc_features_imp %>% 
+  filter(data_source == "train"[1:5000]) %>% 
+  vis_miss()
+```
+
+
+I proceed by exploring the character values. Through simply looking (in the data frame) quickly at the features and exploring the counts of the values within each feature, I decide how to handle these. Some can very easily be converted to factor variables retaining their current set-up, such as "term", "application_type", and "purpose." Other features need substantial pre-processing. 
+
+
+```{r states, echo=FALSE}
+lc_features_imp %>% filter(data_source == "train") %>% 
+ggplot() +
+  aes(x = addr_state, color = default) +
+  geom_bar()
+
+```
+
+For instance, the above plot shows that the state feature includes many small US states, and I reduced the amount of levels by 10 by putting the smallest 11 states in a separate level. Earliest credit line is likely indicative of applicant age. I extracted the years and converted these to numeric. The plot below shows that this feature is skewed and I convert it to a factor based with three bins (containing 10%, 45%, and 45% of the data).
+
+
+```{r}
+## create factor variables
+lc_features_imp <- lc_features_imp %>% 
+  mutate(term = factor(term),
+         emp_length = factor(emp_length),
+         home_ownership = factor(home_ownership),
+         home_ownership = fct_recode(home_ownership, OTHER = "ANY"),
+         purpose = factor(purpose),
+         addr_state = factor(addr_state),
+         addr_state = fct_recode(addr_state, small_states = "AK",
+                                 small_states = "DC", small_states = "DE",
+                                 small_states = "IA", small_states = "ID",
+                                 small_states = "ME", small_states = "ND",
+                                 small_states = "NE", small_states = "SD",
+                                 small_states = "VT", small_states = "WY"),
+         initial_list_status = factor(initial_list_status),
+         application_type = factor(application_type),
+         verification_status_joint = factor(verification_status_joint),
+         revol_util = as.numeric(gsub(pattern = "\\%", replacement = "", revol_util)), # take out % and convert to numeric
+         revol_util_mvi = ifelse(is.na(revol_util), 1, 0), # create variable for missing
+         revol_util = replace_na(revol_util, replace = -1),
+         earliest_cr_line = as.numeric(gsub(pattern = ".*-", replacement = "", earliest_cr_line)), # only keep year, as numeric (likely says something about the age of applicant!)
+         earliest_cr_cat = factor(case_when(earliest_cr_line < 1988 ~ "Before 1988",
+                                     earliest_cr_line < 2000 ~ "1988 - 1999",
+                                     TRUE ~ "2000 -")), # create bins 10%, 45%, 45%
+         career_level = tolower(emp_title),
+         career_level =  factor(case_when(
+             str_detect(career_level, "manager") ~ "Manager",           
+             str_detect(career_level, "lead") ~ "Manager",
+             str_detect(career_level, "coordinator") ~ "Manager",
+           str_detect(career_level, "director") ~ "Executive",
+           str_detect(career_level, "assistant") ~ "Administrative",
+           str_detect(career_level, "administrator") ~ "Administrative",
+           str_detect(career_level, "analyst") ~ "Analyst",
+           str_detect(career_level, "sales") ~ "Sales",
+           str_detect(career_level, "engineer") ~ "Engineer",
+           str_detect(career_level, "inc") ~ "inc",
+           str_detect(career_level, "officer") ~ "Officer",
+           str_detect(career_level, "supervisor") ~ "Supervisor",
+           str_detect(career_level, "driver") ~ "Driver",
+           str_detect(career_level, "nurse") ~ "Nurse",
+           str_detect(career_level, "specialist") ~ "Specialist",
+           str_detect(career_level, "senior") ~ "Senior",
+           str_detect(career_level, "teacher") ~ "Teacher",
+           str_detect(career_level, "service") ~ "Service",
+           str_detect(career_level, "services") ~ "Service",
+           str_detect(career_level, "technician") ~ "Technician",
+           str_detect(career_level, "tech") ~ "Tech",
+           str_detect(career_level, "executive") ~ "Executive",
+           str_detect(career_level, "president") ~ "Executive",
+           TRUE ~ "Other" # if this statement is TRUE, then give it other
+           ))
+
+         )
+
+```
+
+```{r histogram earliest_cr_line, echo=FALSE}
+lc_features_imp %>% filter(data_source == "train") %>% 
+ggplot() +
+  aes(x = earliest_cr_line) +
+  geom_bar()
+```
+
+```{r quantiles earliest_cr_line, echo=FALSE}
+# check quantiles of earliest_cr_line to create bins (skewed)
+quantile(lc_features_imp$earliest_cr_line, c(0.01, .1, .55, 0.99))
+
+```
+
+
+The feature "Employment title"" contains a lot of information. I constructed a -smaller- word cloud, and created a career level variable. For the sake of time, I only included the most prevalent words. Finally, the feature "revol_util"" is converted to a numeric variable (see code chunks above).
+
+![Word cloud of employment titles](images/wordcloud.png){width=50%}
+
+
+There are some remaining features that I remove. Some have no variation (such as pymnt_plan and disbursement_method), title seems already encoded into another feature (purpose), desc appears too random to include any useful information, and zip_code is not too informative for me at this point. I delete them from the analysis. The below data visualisation shows that -after pre-processing- the data frame has no missing values. Character values are converting to factor or numeric features (except for a feature indicating whether the data came from the "train" or "test" data set). The final train and test data sets consist of 146 features.
+
+
+
+```{r}
+##  drop the remaining character variables
+lc_features_imp <- lc_features_imp %>% 
+  select(-pymnt_plan, # OK (no variation)
+         -disbursement_method, # OK (no variation)
+         -desc,# OK (too random)
+         -emp_title, # roughly taken care of
+         -title, # seems to be encoded already into another variable (purpose maybe)
+         -zip_code, # will stay away from this one
+         -earliest_cr_line # handled above (could be an indication of applicant age?)
+         )
+```
+
+```{r data visualisation after pre-processing}
+lc_features_imp %>% 
+  filter(data_source == "train"[1:5000]) %>% 
+  vis_dat()
+
+```
+
+
+Ideally, I would have assessed all numeric variables and their distributions (univariate and in relation to default). Ideally, I would have assessed outliers and skewness and handled them in some way. Undoubtedly, the models would have benefited from this. Yet, I decided to focus my time specifically on including as many features as possible and then to test multiple different models (for applied learning purposes). I decided to take an a-theoretical approach. Partially, this is because I do not have domain knowledge. The main strategy is thus to include as many features as possible and then to get acquinted with different algorithms. I deemed it too time-consuming for this assignment to go through all numeric variables at this stage. This was merely a practical consideration.
+
+
+## Sampling
+The above pre-processing steps were taken for train and test data. I proceed by restoring these into the two original separate data sets. I additionally decide to create an additional validation data set to evaluate the models fitted below. The total amount of examples (train+test) is 650 000. I aim for an approximately 50-25-25 split. I randomly sample a new training and validation set from the provided train set: 325 000 examples into a new train set, and 175 000 examples into the validation set. The original test set has 150 000 examples. I finally check the balance of the target feature across the train, validation, and test datasets and they are similar (see code chunks below).
+
+The above additional split in training and validation data has two purposes. First, in the beginning of the competition I prioritised faster computation, to test different model set-ups (i.e. to test new features etc.) on simpler models. I only used hold-out sampling for this initial process. For later experiments I used the training sample for cross-validation, to work with a somewhat smaller sample. I still also used the validation set to double-check the AUC with an additional hold out data set.
+
+
+```{r sampling, include=FALSE}
+# fully imputed train set
+lc_train_imp <- lc_features_imp %>% 
+  filter(data_source == "train") %>% 
+  select(-data_source)
+
+# divide full train into smaller train and validation sets
+set.seed(1705) # set seed for replicability
+# smaller train
+tr_lc <- sample_n(lc_train_imp, 325000) # randomly sample 50% of total data
+lc_train_imp_small <- lc_train_imp %>%  
+  semi_join(tr_lc, by = "id") 
+# validation
+lc_val_imp_small <- lc_train_imp %>% 
+  anti_join(tr_lc, by = "id") # save those not in train to validation set
+
+# fully imputed test set
+lc_test_imp <- lc_features_imp %>% 
+  filter(data_source == "test") %>% 
+  select(-data_source)
+
+```
+
+```{r balance, echo=FALSE}
+# check balance
+prop.table(table(lc_train_imp$default))
+prop.table(table(lc_train_imp_small$default))
+prop.table(table(lc_val_imp_small$default))
+
+
+```
+
+
+## Experiments comparing models
+
+I started the competition with an attempt to build a theoretically informed predictive logit (AUC:0.6252). This proved difficult without domain knowledge. I therefore decided to continue with the opposite approach: be completely a-theoretical and add as many features as possible to the models I was fitting (throughout the week). On the second day, I therefore submitted a "garbage bin" model with all features I was able to prepare until then. This substantially improved the AUC (0.7137). On the third day, I added features. I then ran a random forest and used this for feature reduction. I then submitted a predictive logit with reduced features (0.7196). For the final day, I added a feature, and the predictive logit remained the best from the models (decision tree/ RF) I had tested until then (AUC:0.7210). After the course week, I worked on further modelling, especially tuning ensemble models (gbm and random forest). The final submitted predictions are the result of a model choosen in this process: a gbm with 550 trees, 7 depth, 0.1 shrinkage.
+
+### GBM experiment
+I run an experiment with caret to assess the best gbm model. I fit 40 different models and used 3-fold cross validation (using the train data). I varied the maximum tree depth (1, 3, 5, 7), the number of trees (150, 250, 350, 450, 550), and the learning rate (shrinkage 0.05 and 0.1). The below figure shows the outcome. Overall, tree size is important, especially with low tree depth. A shrinkage of 0.1 always outperforms a shrinkage of 0.05. Yet, it is likely the lower shrinkage will outperform the lower at higher tree sizes, since the trends are still going up at 0.05, but levelling off with 0.1. Overall, in the experiment, an increase in tree depth always improves the AUC. However, there is only marginal improvements for depth 5 to 7. The winning model (550 trees, 7 depth, 0.1 shrinkage, auc 0.7317 ) is hardly distinguisable from the next best model (550, 5, 0.1, auc: 0.7314). 
+
+![Outcome of the GBM experiment.](images/gbm_experiment.png){width=50%}
+
+### RF experiment
+I also perform an experiment with random forests with 3-fold cross validation. This time I run the experiment with a smaller subsample from the train data (gbm had a very long run time.) I vary mtry from 8 to 12 to 16 (i.e. vary how many features are randomly selected at each split). The default in ranger is the square root of the number of features, which in this case is 12. This is also returned as the optimal in the experiment, see figure below. However, given the results, I still explore if 14 would be better. I run an additional experiment, 12 remains the optimal.
+
+![Ranger: experiment mtry: 12, 14, 16.](images/ranger_exp_8_12_16.png){width=50%}
+![Ranger: experiment with mtry: 12, 14.](images/ranger_exp_12_14.png){width=50%}
+
+
+### Logit regression with random forest feature selection
+I finally run a predictive logit with 3-fold cross-validation (an increase to 6 folds give similar results, I proceed with 3 folds for comparison to the other models). The predictive logit has performed well throughout the competition. I am agnostic about the features in the data set, since I have no domain knowledge. Instead, I rely on the importance values returned by the best random forest above. I select all features with an importance above 15 and include these in a final logit regression (I tested higher importance levels, 15 performed well). This is quite successful with an AUC of 0.7223. It performs better than the random forest the feature selection was based on (0.711), but worse than the GBM (0.7243). The logit, in constrast to the RF and GBM, has some additional advantages. For instance, apart from assessing the predictive value of the features, we can also interpret their substantive effect (i.e. does a feature have a positive or negative effect on the target), which could be useful in some settings (including, I can imagine if ML would complement a qualitative assessment: it shows not only if a feature affects default, but also how). 
+
+## Final comparison
+The above comparison shows, based on 3-fold cross-validation, that a gbm performs best, a predictive logit with feature selection based on a RF second, and the RF third. This is also confirmed when looking at the resampling distributions of the models (although, please note that the RF was run with a smaller train sample): gbm is clearly best. 
+
+![Comparison of resampling distributions](images/resamps.png){width=49%}
+
+
+As a final test, I predict the target values on the hold-out validation set. The figure below shows the three models' ROC curves. The trend is the same: gbm outperforms the other models. The GBM performs even better on the validation data. The logit and RF do not appear to cross the convex hull of the GBM model. Stacking would likely not further improve the predictions.
+
+
+![ROC/ AUC comparison of the three best models](roc_best_tune_gbm_rf_logit.png){width=49%}
+
+
+## A quantitative and qualitative estimate of the model’s future performance
+The above gives estimations on how well I believe the different models will perform on the test data when using AUC. The AUCs of the cross-validations indicate that the gbm will likely have an AUC around 0.73. This is confirmed by applying the model to the held-out validation set. 
+
+I do not think the Lending Club would be happy with the model, and even if they were, I would not advice the Lending Club to actually use this model. The GBM has a high specificity with 0.9745 (i.e. is pretty good at predicting non-defaults), but very low sensitivity with 0.1347. The model simply misses to correctly predict the large majority of the defaults. The kappa is also low (0.1532) and indicates poor agreement. The gbm, however, still performs better on these metrics than the RF (sens.: 0.025, spec. 0.9968, kappa 0.0343) and predictive logit (sens.0.1087, spec. 0.9799, kappa 0.1275).
+
+Overall, the gbm model can be much worked on. There is still much to be gained from feature engineering. I have not much looked at numeric data distributions. Likely, some could benefit from binning or simple feature transformations. Some of the character features contain much information that could be turned into further features. For instance, the employment title feature has only coarsely been used to create a factor variable. It can, for instance, be informative for a feature on which sector the customer is employed in. The earliest credit line variable shows that many have gotten their earliest credit line during the early 2000s financial crisis. This may, for example, be useful for a feature to indicate personal finance problems that could follow a person for some time (possibly combined with the purpose feature). Some further models could be tested (neural networks), and newly engineered features could affect models already used in this report.
